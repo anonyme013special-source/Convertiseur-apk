@@ -1,5 +1,7 @@
 name: HTML vers APK
-on: [push, workflow_dispatch]
+on: workflow_dispatch
+permissions:
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -14,11 +16,12 @@ jobs:
           gradle-version: 8.7
       - name: Generer le projet Android
         run: |
-          HTML="$(ls *.html | head -n 1)"
+          if [ -f app.html ]; then HTML=app.html; else HTML="$(ls *.html | head -n 1)"; fi
           NAME="$(cat nom.txt 2>/dev/null | head -n 1 | tr -d '"<>&|\\' )"
           [ -z "$NAME" ] && NAME="Mon App"
           ID="$(echo "$NAME" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9')"
           [ -z "$ID" ] && ID="app"
+          echo "APPID=$ID" >> "$GITHUB_ENV"
           mkdir -p proj/app/src/main/java/com/amaid/webapp proj/app/src/main/assets
           cp "$HTML" proj/app/src/main/assets/index.html
           cat > proj/settings.gradle.kts <<'EOF'
@@ -64,6 +67,7 @@ jobs:
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
               <application
                   android:label="__NAME__"
                   android:theme="@android:style/Theme.Material.NoActionBar">
@@ -80,13 +84,21 @@ jobs:
           package com.amaid.webapp
 
           import android.app.Activity
+          import android.app.DownloadManager
+          import android.content.Intent
+          import android.net.Uri
           import android.os.Bundle
+          import android.os.Environment
+          import android.webkit.URLUtil
+          import android.webkit.ValueCallback
           import android.webkit.WebChromeClient
           import android.webkit.WebView
           import android.webkit.WebViewClient
+          import android.widget.Toast
 
           class MainActivity : Activity() {
               private lateinit var web: WebView
+              private var cb: ValueCallback<Array<Uri>>? = null
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -96,8 +108,38 @@ jobs:
                   web.settings.domStorageEnabled = true
                   web.settings.mediaPlaybackRequiresUserGesture = false
                   web.webViewClient = WebViewClient()
-                  web.webChromeClient = WebChromeClient()
+                  web.webChromeClient = object : WebChromeClient() {
+                      override fun onShowFileChooser(w: WebView?, c: ValueCallback<Array<Uri>>?, p: FileChooserParams?): Boolean {
+                          cb?.onReceiveValue(null)
+                          cb = c
+                          try {
+                              startActivityForResult(p!!.createIntent(), 1)
+                          } catch (e: Exception) {
+                              cb = null
+                              return false
+                          }
+                          return true
+                      }
+                  }
+                  web.setDownloadListener { url, _, cd, mime, _ ->
+                      val r = DownloadManager.Request(Uri.parse(url))
+                      r.setMimeType(mime)
+                      r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                      r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, URLUtil.guessFileName(url, cd, mime))
+                      (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(r)
+                      Toast.makeText(this, "Telechargement dans Telechargements", Toast.LENGTH_LONG).show()
+                  }
                   web.loadUrl("file:///android_asset/index.html")
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  if (requestCode == 1) {
+                      cb?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data))
+                      cb = null
+                  } else {
+                      super.onActivityResult(requestCode, resultCode, data)
+                  }
               }
 
               @Deprecated("Deprecated in Java")
@@ -110,13 +152,19 @@ jobs:
           sed -i "s|__NAME__|$NAME|" proj/app/src/main/AndroidManifest.xml
       - name: Icone
         run: |
-          PNG="$(ls *.png 2>/dev/null | head -n 1)"
+          if [ -f icone.png ]; then PNG=icone.png; else PNG="$(ls *.png 2>/dev/null | head -n 1)"; fi
           if [ -n "$PNG" ]; then
             mkdir -p proj/app/src/main/res/drawable-nodpi
             convert "$PNG" -resize 192x192 proj/app/src/main/res/drawable-nodpi/icon.png || cp "$PNG" proj/app/src/main/res/drawable-nodpi/icon.png
             sed -i 's|<application|<application android:icon="@drawable/icon"|' proj/app/src/main/AndroidManifest.xml
           fi
       - run: cd proj && gradle assembleDebug
+      - name: Publier
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp proj/app/build/outputs/apk/debug/app-debug.apk "$APPID.apk"
+          gh release create "apk-${{ github.run_number }}" "$APPID.apk" --title "$APPID" --notes "APK" --repo "${{ github.repository }}"
       - uses: actions/upload-artifact@v4
         with:
           name: apk
